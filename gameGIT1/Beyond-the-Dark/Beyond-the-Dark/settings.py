@@ -25,6 +25,10 @@ TEXT_COLOR = (220, 220, 220)
 # Получаем путь к папке, где лежит этот файл
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# --- НОВЫЕ ПУТИ К АССЕТАМ (.jpg) ---
+PLAYER_SPRITE_SHEET = os.path.join(BASE_DIR, "assets", "animations.jpg")
+BACKGROUND_1LVL = os.path.join(BASE_DIR, "assets", "background_1lvl.jpg")
+
 # И привязываем пути к музлу через os.path.join
 LEVEL_MUSIC = {
     "lobby": os.path.join(BASE_DIR, "music", "menu.mp3"),

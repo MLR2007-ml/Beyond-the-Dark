@@ -5,23 +5,66 @@ import sys
 import settings
 from player import Player
 from entities import Wall, Coin
-from settings import SCREEN_WIDTH, SCREEN_HEIGHT, FPS, BG_COLOR, TEXT_COLOR, LEVEL_MUSIC
+from settings import SCREEN_WIDTH, SCREEN_HEIGHT, FPS, BG_COLOR, TEXT_COLOR, LEVEL_MUSIC, BACKGROUND_1LVL
 
 pygame.init()
 pygame.mixer.init()
 
-# Центрирование окна на экране монитора по центру
 os.environ['SDL_VIDEO_CENTERED'] = '1'
 
-# Создание или обновление экрана
 screen = pygame.display.set_mode((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT))
 pygame.display.set_caption("Beyond the Dark - Меню и Настройки")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont("Arial", 20)
 font_large = pygame.font.SysFont("Arial", 32)
 
-# Применяем стартовую громкость
 pygame.mixer.music.set_volume(settings.MUSIC_VOLUME)
+
+# --- ФОНЫ УРОВНЕЙ ---
+LEVEL_BACKGROUNDS = {
+    1: BACKGROUND_1LVL,
+}
+BACKGROUND_DIM_ALPHA = 70   # лёгкое затемнение фона, чтобы уровень читался лучше
+_background_cache = {}
+
+
+def get_level_background(level_num, size):
+    """Фон уровня, растянутый по размеру окна с сохранением пропорций (кэшируется)."""
+    path = LEVEL_BACKGROUNDS.get(level_num)
+    if not path or not os.path.exists(path):
+        return None
+
+    key = (level_num, size)
+    if key in _background_cache:
+        return _background_cache[key]
+
+    try:
+        image = pygame.image.load(path)
+    except pygame.error as e:
+        print(f"[ОШИБКА] Не удалось открыть фон {path}: {e}")
+        _background_cache[key] = None
+        return None
+
+    img_w, img_h = image.get_size()
+    # Масштаб "по покрытию": фон заполняет окно, лишнее обрезается по центру
+    factor = max(size[0] / img_w, size[1] / img_h)
+    scaled = pygame.transform.smoothscale(
+        image, (max(size[0], int(round(img_w * factor))),
+                max(size[1], int(round(img_h * factor)))))
+
+    crop = pygame.Rect(0, 0, size[0], size[1])
+    crop.center = scaled.get_rect().center
+    result = scaled.subsurface(crop).copy()
+
+    if BACKGROUND_DIM_ALPHA > 0:
+        dim = pygame.Surface(size, pygame.SRCALPHA)
+        dim.fill((0, 0, 0, BACKGROUND_DIM_ALPHA))
+        result.blit(dim, (0, 0))
+
+    _background_cache[key] = result
+    print(f"[УСПЕХ] Фон уровня {level_num} загружен: {path}")
+    return result
+
 
 LEVELS = {
     1: [
@@ -62,6 +105,11 @@ LEVELS = {
     ]
 }
 
+walls = pygame.sprite.Group()
+coins = pygame.sprite.Group()
+collecting_coins = pygame.sprite.Group()
+all_sprites = pygame.sprite.Group()
+
 def play_music(track_key):
     if track_key in LEVEL_MUSIC:
         try:
@@ -76,6 +124,8 @@ def load_level(level_num, walls_group, coins_group, sprites_group):
         sprite.kill()
     for sprite in coins_group:
         sprite.kill()
+    for sprite in collecting_coins:
+        sprite.kill()
         
     map_data = LEVELS.get(level_num, LEVELS[1])
     block_size = 50
@@ -84,7 +134,7 @@ def load_level(level_num, walls_group, coins_group, sprites_group):
     level_height = len(map_data) * block_size
     
     offset_x = (settings.SCREEN_WIDTH - level_width) // 2
-    offset_y = (settings.SCREEN_HEIGHT - level_height) // 2 + 50  # Чуть ниже центра для комфортных прыжков
+    offset_y = (settings.SCREEN_HEIGHT - level_height) // 2 + 50
 
     for row_idx, row in enumerate(map_data):
         for col_idx, char in enumerate(row):
@@ -108,25 +158,19 @@ def load_level(level_num, walls_group, coins_group, sprites_group):
     play_music(level_num)
     return new_player
 
-walls = pygame.sprite.Group()
-coins = pygame.sprite.Group()
-all_sprites = pygame.sprite.Group()
-
 game_state = "menu"
 current_level = 1
 score = 0
 player = None
 
 dragging_slider = False
-dropdown_open = False  # Состояние выпадающего списка разрешений
+dropdown_open = False
 
 play_music("lobby")
 
-# Главный игровой цикл
 while True:
     mouse_pos = pygame.mouse.get_pos()
     
-    # Единая инициализация координат элементов интерфейса для каждого кадра
     cx = settings.SCREEN_WIDTH // 2
     btn_play_rect = pygame.Rect(cx - 100, 220, 200, 50)
     btn_settings_rect = pygame.Rect(cx - 100, 300, 200, 50)
@@ -238,20 +282,27 @@ while True:
                     game_state = "menu"
                     for s in walls: s.kill()
                     for s in coins: s.kill()
+                    for s in collecting_coins: s.kill()
                     if player: player.kill()
                     play_music("lobby")
 
-    # Игровая логика уровней (опрос зажатых клавиш каждый кадр для идеального мульти-нажатия)
     if isinstance(game_state, int) and player:
         keys = pygame.key.get_pressed()
         player.handle_input(keys)
         player.update(walls)
 
-        collected_coins = pygame.sprite.spritecollide(player, coins, True)
+        coins.update()
+        collecting_coins.update()
+
+        collected_coins = pygame.sprite.spritecollide(player, coins, False)
+        for coin in collected_coins:
+            coins.remove(coin)
+            collecting_coins.add(coin)
+            coin.collect()
         if collected_coins:
             score += len(collected_coins)
 
-        if len(coins) == 0:
+        if len(coins) == 0 and len(collecting_coins) == 0:
             if current_level < len(LEVELS):
                 current_level += 1
                 player = load_level(current_level, walls, coins, all_sprites)
@@ -337,6 +388,11 @@ while True:
         screen.blit(back_txt, (btn_back.centerx - back_txt.get_width() // 2, btn_back.centery - back_txt.get_height() // 2))
 
     elif isinstance(game_state, int):
+        # --- ОТРИСОВКА ФОНА УРОВНЯ ---
+        background = get_level_background(current_level, screen.get_size())
+        if background:
+            screen.blit(background, (0, 0))
+
         all_sprites.draw(screen)
         ui_text = font.render(f"Уровень: {current_level} | Монет: {score} | ESC - в меню", True, TEXT_COLOR)
         screen.blit(ui_text, (50, 20))
