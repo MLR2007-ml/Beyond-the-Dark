@@ -7,8 +7,9 @@ import pygame
 
 import progress
 import settings
+from audio import SoundBank
 from boss import Dragon
-from entities import Bridge, Coin, CoinBurst, Goal, Lever, Skeleton, Spike, Wall
+from entities import Bridge, Coin, CoinBurst, Goal, Heart, Lever, Skeleton, Spike, Wall
 from pixelfont import PixelFont, draw_hearts, draw_panel
 from player import Player
 
@@ -26,11 +27,14 @@ LEVEL_SPECS = {
         "width": 30,
         "pits": [(17, 23)],
         "steps": [(7, 4, 8), (7, 25, 26)],
-        "platforms": [(5, 10, 12), (3, 13, 15)],
+        # между платформами обязателен зазор в 1 клетку, иначе под верхней
+        # не остаётся места для прыжка и до секретной зоны не добраться
+        "platforms": [(5, 10, 11), (3, 13, 15)],
         "coins": [(6, 6), (6, 7), (4, 10), (4, 11), (2, 13), (2, 14),
                   (7, 9), (7, 20), (6, 25), (8, 27)],
         "spikes": [(8, 9), (8, 16), (8, 24)],
         "levers": [(8, 14)],
+        "hearts": [(8, 11), (8, 15)],
         "goal": (8, 28),
         "spawn": (8, 2),
         "secrets": [pygame.Rect(620, 190, 180, 170)],
@@ -44,7 +48,8 @@ LEVEL_SPECS = {
                   (2, 14), (7, 21), (6, 27), (8, 31)],
         "spikes": [(8, 13), (8, 14), (8, 29)],
         "levers": [(8, 16)],
-        "skeletons": [(8, 3), (8, 10), (8, 17), (8, 26), (8, 30)],
+        "skeletons": [(8, 8), (8, 12), (8, 17), (8, 26)],
+        "hearts": [(8, 10), (8, 30)],
         "goal": (8, 32),
         "spawn": (8, 2),
         "secrets": [pygame.Rect(630, 190, 190, 170)],
@@ -57,6 +62,7 @@ LEVEL_SPECS = {
         "coins": [(8, 2), (8, 5), (8, 8), (8, 11), (8, 13)],
         "spikes": [],
         "levers": [],
+        "hearts": [(8, 3), (8, 9)],
         "goal": None,
         "spawn": (8, 1),
         "boss": True,
@@ -97,6 +103,8 @@ def build_level(spec):
         rows[row_index][col] = "$"
     for row_index, col in spec.get("levers", ()):
         rows[row_index][col] = "L"
+    for row_index, col in spec.get("hearts", ()):
+        rows[row_index][col] = "H"
     for row_index, col in spec.get("skeletons", ()):
         rows[row_index][col] = "E"
     if spec.get("goal"):
@@ -170,6 +178,14 @@ class Game:
         except pygame.error as exc:
             print(f"[ПРЕДУПРЕЖДЕНИЕ] Аудио недоступно: {exc}")
 
+        # Громкости из прошлой сессии — применяем до загрузки звуков
+        saved_music, saved_sfx = progress.audio_volumes()
+        if saved_music is not None:
+            settings.MUSIC_VOLUME = saved_music
+        if saved_sfx is not None:
+            settings.SFX_VOLUME = saved_sfx
+        self.sfx = SoundBank()
+
         pygame.display.set_caption("Beyond the Dark")
         self.screen = self._create_window()
         self.canvas = pygame.Surface((LOGICAL_WIDTH, LOGICAL_HEIGHT)).convert()
@@ -195,6 +211,7 @@ class Game:
         self.bridges = []
         self.levers = []
         self.skeletons = []
+        self.hearts = []
         self.goal = None
         self.effects = []
         self.floor_top = GRID_Y + 9 * BLOCK
@@ -219,7 +236,7 @@ class Game:
         self._backgrounds = {}
         self.ui = {}
         self.dropdown_open = False
-        self.dragging_volume = False
+        self.dragging_slider = None   # "music" / "sfx" / None — что тянем мышью
 
         self.play_music("lobby")
 
@@ -404,6 +421,7 @@ class Game:
         self.bridges = []
         self.levers = []
         self.skeletons = []
+        self.hearts = []
         self.goal = None
         self.effects = []
         self.camera_x = 0.0
@@ -420,27 +438,69 @@ class Game:
         self.floor_top = GRID_Y + (len(rows) - 1) * BLOCK
         spawn = (GRID_X + BLOCK + BLOCK // 2, self.floor_top)
 
+        def is_solid(row_index, col_index):
+            """Есть ли твёрдый блок в клетке (за пределами сетки — нет)."""
+            if 0 <= row_index < len(rows) and 0 <= col_index < len(rows[0]):
+                return rows[row_index][col_index] == "#"
+            return False
+
+        spans = []
         for row_index, row in enumerate(rows):
-            for col_index, cell in enumerate(row):
-                x = GRID_X + col_index * BLOCK
-                y = GRID_Y + row_index * BLOCK
-                if cell == "#":
-                    self.walls.append(Wall(x, y, BLOCK, BLOCK, theme))
-                elif cell == "$":
-                    self.coins.append(Coin(x + BLOCK // 2, y + BLOCK // 2))
-                elif cell == "^":
-                    self.spikes.append(Spike(x + 5, y + BLOCK - Spike.HEIGHT,
-                                             width=BLOCK - 10))
-                elif cell == "L":
-                    self.levers.append(Lever(x, self.floor_top))
-                elif cell == "G":
-                    self.goal = Goal(x, self.floor_top)
-                elif cell == "E":
-                    floor = self._floor_top(rows, row_index, col_index)
-                    self.skeletons.append(Skeleton(x + BLOCK // 2, floor))
-                elif cell == "P":
-                    spawn = (x + BLOCK // 2,
-                             self._floor_top(rows, row_index, col_index))
+            col_index = 0
+            while col_index < len(row):
+                cell = row[col_index]
+                if cell != "#":
+                    x = GRID_X + col_index * BLOCK
+                    y = GRID_Y + row_index * BLOCK
+                    if cell == "$":
+                        self.coins.append(Coin(x + BLOCK // 2, y + BLOCK // 2))
+                    elif cell == "^":
+                        self.spikes.append(Spike(x + 5, y + BLOCK - Spike.HEIGHT,
+                                                 width=BLOCK - 10))
+                    elif cell == "L":
+                        self.levers.append(Lever(x, self.floor_top))
+                    elif cell == "G":
+                        self.goal = Goal(x, self.floor_top)
+                    elif cell == "H":
+                        self.hearts.append(Heart(x, self._floor_top(rows, row_index,
+                                                                    col_index), BLOCK))
+                    elif cell == "E":
+                        floor = self._floor_top(rows, row_index, col_index)
+                        self.skeletons.append(Skeleton(x + BLOCK // 2, floor))
+                    elif cell == "P":
+                        spawn = (x + BLOCK // 2,
+                                 self._floor_top(rows, row_index, col_index))
+                    col_index += 1
+                    continue
+
+                # непрерывная горизонтальная серия блоков
+                first = col_index
+                while col_index < len(row) and row[col_index] == "#":
+                    col_index += 1
+                spans.append((row_index, first, col_index - 1))
+
+        # Сплошные плиты: одинаковые по ширине серии соседних рядов сливаются в
+        # один монолит — пол, потолок, ступени и стены без внутренних швов.
+        monoliths = []
+        for row_index, first, last in spans:
+            for block in monoliths:
+                if (block[1] == first and block[2] == last
+                        and block[3] == row_index - 1):
+                    block[3] = row_index
+                    break
+            else:
+                monoliths.append([row_index, first, last, row_index])
+
+        for row0, first, last, row1 in monoliths:
+            exposed = (any(not is_solid(row0 - 1, col) for col in range(first, last + 1)),
+                       any(not is_solid(row1 + 1, col) for col in range(first, last + 1)),
+                       any(not is_solid(row, first - 1) for row in range(row0, row1 + 1)),
+                       any(not is_solid(row, last + 1) for row in range(row0, row1 + 1)))
+            self.walls.append(Wall(GRID_X + first * BLOCK,
+                                   GRID_Y + row0 * BLOCK,
+                                   (last - first + 1) * BLOCK,
+                                   (row1 - row0 + 1) * BLOCK,
+                                   theme, exposed))
 
         for first, last in spec.get("pits", ()):
             self.bridges.append(Bridge(GRID_X + first * BLOCK,
@@ -449,8 +509,9 @@ class Game:
         self.coin_total = len(self.coins)
         self.skeleton_total = len(self.skeletons)
         self.player = Player(spawn[0], spawn[1])
+        self.player.invuln_timer = settings.PLAYER_SPAWN_INVULN_TICKS
         if spec.get("boss"):
-            self.boss = Dragon(self.level_width - 155, self.floor_top)
+            self.boss = Dragon(self.level_width - 155, self.floor_top, GRID_Y + BLOCK)
 
         self.death_timer = 0
         self.transition_timer = 0
@@ -532,9 +593,8 @@ class Game:
             self.message_timer -= 1
 
         if self.death_timer > 0:
+            # Экран смерти висит до нажатия «ЗАНОВО» (или R) — кнопка всегда доступна
             self.death_timer += 1
-            if self.death_timer >= 150:
-                self.restart_level()
             return
 
         if self.transition_timer > 0:
@@ -554,6 +614,8 @@ class Game:
 
         for coin in self.coins:
             coin.update()
+        for heart in self.hearts:
+            heart.update()
         for spike in self.spikes:
             spike.update(player)
         for lever in self.levers:
@@ -571,7 +633,17 @@ class Game:
             if player.rect.colliderect(coin.rect):
                 self.coins.remove(coin)
                 self.score += 1
+                self.sfx.play("coin")
                 self.effects.append(CoinBurst(coin.rect.centerx, coin.rect.centery))
+
+        # Хилки: поднимаем сердце, только если здоровье не полное
+        for heart in self.hearts[:]:
+            if player.hp < player.max_hp and player.rect.colliderect(heart.rect):
+                self.hearts.remove(heart)
+                player.hp = min(player.max_hp, player.hp + heart.heal)
+                self.sfx.play("heal")
+                self.effects.append(CoinBurst(heart.rect.centerx, heart.rect.centery,
+                                              label="+1", color=(255, 120, 138)))
 
         # Шипы
         if player.alive and player.invuln_timer <= 0:
@@ -602,6 +674,7 @@ class Game:
                 player.attack_hit_done = True
                 direction = 1 if skeleton.rect.centerx >= player.rect.centerx else -1
                 killed = skeleton.take_damage(settings.PLAYER_ATTACK_DAMAGE, direction)
+                self.sfx.play("skeleton_hit")
                 self.effects.append(HitSpark(skeleton.rect.centerx, skeleton.rect.centery))
                 if killed:
                     self.kills += 1
@@ -622,6 +695,7 @@ class Game:
                     and swing.colliderect(self.boss.rect)):
                 player.attack_hit_done = True
                 self.boss.take_damage(settings.PLAYER_ATTACK_DAMAGE)
+                self.sfx.play("skeleton_hit")
                 self.effects.append(HitSpark(swing.centerx, swing.centery))
             if self.boss.defeated:
                 self.finish_level()
@@ -670,6 +744,9 @@ class Game:
 
     def settings_layout(self):
         center_x = LOGICAL_WIDTH // 2
+        # два ползунка в ряд: музыка слева, звуки справа
+        music_track = pygame.Rect(132, 132, 232, 10)
+        sfx_track = pygame.Rect(436, 132, 232, 10)
         res_button = pygame.Rect(center_x - 170, 204, 340, 44)
         options = [pygame.Rect(res_button.x, res_button.bottom + 6 + index * 28,
                                res_button.width, 26)
@@ -679,8 +756,10 @@ class Game:
         mode_start = center_x - mode_total // 2
         return {
             "panel": pygame.Rect(100, 40, 600, 540),
-            "slider": pygame.Rect(240, 132, 320, 10),
-            "slider_hit": pygame.Rect(232, 120, 336, 34),
+            "slider_music": music_track,
+            "slider_music_hit": music_track.inflate(16, 24),
+            "slider_sfx": sfx_track,
+            "slider_sfx_hit": sfx_track.inflate(16, 24),
             "res_button": res_button,
             "res_options": options,
             "mode_label_y": 440,
@@ -779,14 +858,33 @@ class Game:
         self.screen = self._create_window()
         pygame.display.set_caption("Beyond the Dark")
 
-    def set_volume_from_x(self, x):
-        track = self.settings_layout()["slider"]
+    def set_music_volume_from_x(self, x):
+        track = self.settings_layout()["slider_music"]
         ratio = (x - track.x) / max(1, track.width)
         settings.MUSIC_VOLUME = round(max(0.0, min(1.0, ratio)), 2)
         try:
             pygame.mixer.music.set_volume(settings.MUSIC_VOLUME)
         except pygame.error:
             pass
+
+    def set_sfx_volume_from_x(self, x):
+        track = self.settings_layout()["slider_sfx"]
+        ratio = (x - track.x) / max(1, track.width)
+        settings.SFX_VOLUME = round(max(0.0, min(1.0, ratio)), 2)
+        self.sfx.set_volume(settings.SFX_VOLUME)
+
+    def draw_slider(self, track, value, hovered=False):
+        """Ползунок громкости: жёлоб, заполненная часть и ручка."""
+        pygame.draw.rect(self.canvas, (40, 36, 48), track)
+        filled = pygame.Rect(track.x, track.y, int(track.width * value), track.height)
+        if filled.width > 0:
+            pygame.draw.rect(self.canvas, (196, 166, 96), filled)
+        pygame.draw.rect(self.canvas, settings.TEXT_ACCENT if hovered else (176, 156, 112),
+                         track, 1)
+        knob_x = track.x + int(track.width * value)
+        pygame.draw.rect(self.canvas, (250, 238, 204) if hovered else (234, 220, 188),
+                         (knob_x - 6, track.y - 6, 12, 22))
+        pygame.draw.rect(self.canvas, (120, 104, 78), (knob_x - 6, track.y - 6, 12, 22), 1)
 
     def draw_settings(self, mouse):
         self.draw_background(3, 190)
@@ -797,19 +895,18 @@ class Game:
         self.font.draw(self.canvas, "НАСТРОЙКИ", (LOGICAL_WIDTH // 2, 64),
                        scale=3, color=settings.TEXT_ACCENT, anchor="center", shadow=True)
 
-        volume_percent = int(round(settings.MUSIC_VOLUME * 100))
-        self.font.draw(self.canvas, f"Громкость музыки: {volume_percent}%",
-                       (LOGICAL_WIDTH // 2, 100), anchor="midtop")
-
-        track = layout["slider"]
-        pygame.draw.rect(self.canvas, (40, 36, 48), track)
-        filled = pygame.Rect(track.x, track.y, int(track.width * settings.MUSIC_VOLUME),
-                             track.height)
-        pygame.draw.rect(self.canvas, (196, 166, 96), filled)
-        pygame.draw.rect(self.canvas, (222, 202, 152), track, 1)
-        knob_x = track.x + int(track.width * settings.MUSIC_VOLUME)
-        pygame.draw.rect(self.canvas, (246, 234, 198), (knob_x - 6, track.y - 6, 12, 22))
-        pygame.draw.rect(self.canvas, (120, 104, 78), (knob_x - 6, track.y - 6, 12, 22), 1)
+        music_percent = int(round(settings.MUSIC_VOLUME * 100))
+        sfx_percent = int(round(settings.SFX_VOLUME * 100))
+        music_track = layout["slider_music"]
+        sfx_track = layout["slider_sfx"]
+        self.font.draw(self.canvas, f"Громкость музыки: {music_percent}%",
+                       (music_track.centerx, 98), anchor="midtop")
+        self.draw_slider(music_track, settings.MUSIC_VOLUME,
+                         layout["slider_music_hit"].collidepoint(mouse))
+        self.font.draw(self.canvas, f"Громкость звуков: {sfx_percent}%",
+                       (sfx_track.centerx, 98), anchor="midtop")
+        self.draw_slider(sfx_track, settings.SFX_VOLUME,
+                         layout["slider_sfx_hit"].collidepoint(mouse))
 
         self.font.draw(self.canvas, "Разрешение", (LOGICAL_WIDTH // 2, 180),
                        anchor="midtop")
@@ -865,9 +962,14 @@ class Game:
         if layout["res_button"].collidepoint(pos):
             self.dropdown_open = True
             return
-        if layout["slider_hit"].collidepoint(pos):
-            self.dragging_volume = True
-            self.set_volume_from_x(pos[0])
+        if layout["slider_music_hit"].collidepoint(pos):
+            self.dragging_slider = "music"
+            self.set_music_volume_from_x(pos[0])
+            return
+        if layout["slider_sfx_hit"].collidepoint(pos):
+            self.dragging_slider = "sfx"
+            self.set_sfx_volume_from_x(pos[0])
+            self.sfx.play("coin")      # сразу слышно, насколько громко стало
             return
         for index, key in ((0, "mode_window"), (1, "mode_borderless"),
                            (2, "mode_fullscreen")):
@@ -935,6 +1037,9 @@ class Game:
             rect = coin.draw_rect.move(offset)
             if rect.right > 0 and rect.left < LOGICAL_WIDTH:
                 self.canvas.blit(coin.image, rect)
+        for heart in self.hearts:
+            if -40 < heart.rect.centerx - camera < LOGICAL_WIDTH + 40:
+                heart.draw(self.canvas, offset)
         for lever in self.levers:
             if -60 < lever.rect.centerx - camera < LOGICAL_WIDTH + 60:
                 lever.draw(self.canvas, offset)
@@ -1000,7 +1105,7 @@ class Game:
             self.dim_screen(175)
             self.font.draw(self.canvas, "ВЫ ПОГИБЛИ", (LOGICAL_WIDTH // 2, 210),
                            scale=3, color=(232, 74, 74), anchor="center", shadow=True)
-            self.draw_muted("Сердца закончились — уровень начнётся заново",
+            self.draw_muted("Сердца закончились — нажмите «ЗАНОВО» или R",
                             (LOGICAL_WIDTH // 2, 262), anchor="center")
             restart = pygame.Rect(300, 306, 200, 48)
             self.draw_button(restart, "ЗАНОВО", restart.collidepoint(mouse),
@@ -1070,7 +1175,8 @@ class Game:
             if self.transition_timer > 0:
                 return
             if self.player is not None:
-                self.player.start_attack()
+                if self.player.start_attack():
+                    self.sfx.play("swing")
         elif self.state == "victory":
             if self.ui.get("again") and self.ui["again"].collidepoint(pos):
                 self.start_game(3)
@@ -1130,15 +1236,26 @@ class Game:
             mouse = self.logical_mouse()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    progress.save_audio_volumes(settings.MUSIC_VOLUME,
+                                                settings.SFX_VOLUME)
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
                     self.handle_key(event.key)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_click(self.logical_mouse())
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    self.dragging_volume = False
-                elif event.type == pygame.MOUSEMOTION and self.dragging_volume:
-                    self.set_volume_from_x(self.logical_mouse()[0])
+                    if self.dragging_slider == "sfx":
+                        self.sfx.play("coin")   # проверка громкости после перетаскивания
+                    if self.dragging_slider:
+                        progress.save_audio_volumes(settings.MUSIC_VOLUME,
+                                                    settings.SFX_VOLUME)
+                    self.dragging_slider = None
+                elif event.type == pygame.MOUSEMOTION and self.dragging_slider:
+                    x = self.logical_mouse()[0]
+                    if self.dragging_slider == "music":
+                        self.set_music_volume_from_x(x)
+                    else:
+                        self.set_sfx_volume_from_x(x)
 
             if self.state == "playing":
                 self.update_playing(pygame.key.get_pressed())

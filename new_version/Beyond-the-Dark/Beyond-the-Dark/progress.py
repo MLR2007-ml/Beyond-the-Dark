@@ -17,8 +17,10 @@ def load():
     try:
         with open(settings.SAVE_FILE, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
-        if isinstance(raw, dict) and isinstance(raw.get("levels"), dict):
+        if isinstance(raw, dict):
             data = raw
+            if not isinstance(data.get("levels"), dict):
+                data["levels"] = {}
     except (OSError, ValueError):
         data = {"levels": {}}
 
@@ -66,6 +68,28 @@ def level_info(level):
     """(лучшие монеты, звёзды) для карточки выбора уровня."""
     entry = load()["levels"].get(str(level), {})
     return entry.get("coins", 0), entry.get("stars", 0)
+
+
+def audio_volumes():
+    """Сохранённые громкости музыки и звуков (None — значения по умолчанию)."""
+    data = load().get("audio")
+    if not isinstance(data, dict):
+        return None, None
+
+    result = []
+    for key in ("music", "sfx"):
+        value = data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            result.append(max(0.0, min(1.0, float(value))))
+        else:
+            result.append(None)
+    return result[0], result[1]
+
+
+def save_audio_volumes(music, sfx):
+    """Запоминает громкости, чтобы ползунки стояли на месте после перезапуска."""
+    load()["audio"] = {"music": round(float(music), 2), "sfx": round(float(sfx), 2)}
+    flush()
 
 
 def total_stars():

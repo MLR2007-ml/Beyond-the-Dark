@@ -10,12 +10,231 @@ import pygame
 
 import settings
 
-# Палитры блоков для разных уровней: (основа, свет, тень, блик)
+# Палитры блоков по уровням: основа, свет, тень, блик и цвет нароста на верхней
+# кромке. style задаёт мелкие детали: мох в лесу, выщербленный камень в пещере,
+# угольки в финале.
 WALL_THEMES = {
-    1: ((52, 72, 50), (78, 104, 64), (30, 44, 32), (104, 134, 78)),
-    2: ((50, 52, 72), (78, 80, 106), (28, 30, 44), (110, 112, 140)),
-    3: ((58, 40, 44), (88, 62, 66), (30, 20, 24), (126, 78, 76)),
+    1: {"base": (70, 82, 52), "light": (118, 138, 86), "dark": (34, 42, 30),
+        "accent": (150, 172, 102), "top": (104, 156, 76), "soil": (104, 84, 56),
+        "style": "moss"},
+    2: {"base": (64, 66, 88), "light": (100, 104, 132), "dark": (32, 34, 52),
+        "accent": (128, 134, 162), "soil": (78, 74, 84), "style": "stone"},
+    3: {"base": (84, 54, 56), "light": (158, 110, 90), "dark": (34, 22, 26),
+        "accent": (250, 132, 64), "soil": (102, 62, 50), "style": "ember"},
 }
+
+_BLOCK_TILE = 50          # сторона клетки сетки уровня (main.BLOCK)
+
+
+def _clamp_byte(value):
+    return max(0, min(255, int(round(value))))
+
+
+def _shift(color, delta):
+    """Осветляет (delta > 0) или затемняет цвет на delta."""
+    return tuple(_clamp_byte(channel + delta) for channel in color)
+
+
+def _mix(color, other, ratio):
+    """Смешивает два цвета: ratio = 0 — color, ratio = 1 — other."""
+    return tuple(int(round(color[i] + (other[i] - color[i]) * ratio)) for i in range(3))
+
+
+def _block_seed(x, y):
+    """Постоянный seed для блока по его мировым координатам."""
+    return ((int(x) // _BLOCK_TILE) * 73856093) ^ ((int(y) // _BLOCK_TILE) * 19349663)
+
+
+def _stone_patch(image, center_x, center_y, radius_x, radius_y, color, rng,
+                 edge_color=None):
+    """Рыхлое пятно породы: рваный край тает в основе блока.
+
+    edge_color — цвет основы: края подмешиваются к нему, поэтому вкрапление
+    не выглядит наклейкой поверх камня.
+    """
+    width, height = image.get_size()
+    rim = _mix(color, edge_color if edge_color else color, 0.55)
+    light_color = _shift(color, 3)
+    dark_color = _shift(color, -5)
+    for offset_y in range(-radius_y, radius_y + 1):
+        ratio = 1.0 - (offset_y / (radius_y + 0.6)) ** 2
+        half = int(round(radius_x * math.sqrt(max(0.0, ratio))))
+        if half <= 0:
+            continue
+        row = center_y + offset_y
+        if not 0 <= row < height:
+            continue
+        left = max(1, center_x - half)
+        right = min(width - 1, center_x + half + 1)
+        while left < right and rng.random() < 0.4:      # рваный край
+            left += 1
+        while right > left and rng.random() < 0.4:
+            right -= 1
+        if right - left < 3:
+            continue
+        if abs(offset_y) >= radius_y:
+            tone = rim
+        elif offset_y < 0:
+            tone = light_color
+        elif offset_y > radius_y // 2:
+            tone = dark_color
+        else:
+            tone = color
+        image.fill(tone, (left, row, right - left, 1))
+        if left - 1 > 0 and rng.random() < 0.3:          # крошка у края
+            image.fill(rim, (left - 1, row, 1, 1))
+        if right < width - 1 and rng.random() < 0.3:
+            image.fill(rim, (right, row, 1, 1))
+
+
+def _paint_block(image, theme, seed, exposed=(True, True, True, True)):
+    """Рисует текстуру блока: грунт, крапины, трещины и объём по граням.
+
+    exposed — (сверху, снизу, слева, справа): True, если соседнего блока с этой
+    стороны нет. Открытые грани получают светлую/тёмную кромку, скрытые — тонкий
+    шов, поэтому ряд блоков читается как кладка, а не как одна плоская плита.
+    """
+    palette = WALL_THEMES.get(theme, WALL_THEMES[1])
+    base, light, dark = palette["base"], palette["light"], palette["dark"]
+    accent, style = palette["accent"], palette["style"]
+    width, height = image.get_size()
+    rng = random.Random(seed)
+    tone = rng.randint(-6, 6)          # блоки чуть отличаются по яркости
+
+    # 1. Основа: сверху светлее, к низу темнее — появляется объём.
+    # Скрытая верхняя грань не подсвечивается, иначе в стопке блоков виден светлый шов.
+    top_open, bottom_open, left_open, right_open = exposed
+    bands = max(10, height // 5)      # высокие монолиты не должны «полосить»
+    band_height = height / bands
+    top_shade = _shift(base, (18 if top_open else -6) + tone)
+    bottom_shade = _shift(base, (-26 if bottom_open else -15) + tone)
+    for band in range(bands):
+        top = int(round(band * band_height))
+        bottom = int(round((band + 1) * band_height))
+        image.fill(_mix(top_shade, bottom_shade, band / (bands - 1)),
+                   (0, top, width, max(1, bottom - top)))
+
+    # 2. Пятна породы: мелкие вкрапления, блок перестаёт быть однотонным.
+    # Количество зависит от площади — длинная полоса пола не остаётся пустой.
+    patch_count = max(2, int(width * height / 1600))
+    max_radius_x = max(4, min(14, width // 10))
+    max_radius_y = max(3, height // 13)
+    for _ in range(patch_count):
+        radius_x = rng.randint(3, max_radius_x)
+        radius_y = rng.randint(2, max_radius_y)
+        center_x = rng.randint(radius_x + 2, max(radius_x + 3, width - radius_x - 3))
+        center_y = rng.randint(radius_y + 7, max(radius_y + 8, height - radius_y - 4))
+        mix_ratio = rng.uniform(0.12, 0.26)
+        target = light if rng.random() < 0.3 else dark
+        _stone_patch(image, center_x, center_y, radius_x, radius_y,
+                     _mix(base, target, mix_ratio), rng, base)
+
+    # 3. Слоистость: прерывистая линия — намёк на осадочную породу
+    for _ in range(max(1, width // 130)):
+        line_y = rng.randrange(height // 3, max(height // 3 + 1, height - 5))
+        start = rng.randrange(2, max(3, width - 14))
+        end = min(width - 2, start + rng.randint(10, max(11, min(width // 2, 130))))
+        image.fill(_mix(base, dark, 0.18), (start, line_y, end - start, 1))
+        if end - start > 12:
+            image.fill(_mix(base, dark, 0.11),
+                       (start + 5, line_y + 1, end - start - 9, 1))
+
+    # 4. Зерно: редкие неяркие крапины дают «каменную» фактуру
+    soft_light = _mix(light, base, 0.5)
+    soft_dark = _mix(dark, base, 0.3)
+    ember_dust = 0.2 if style == "ember" else 0.05   # угольки — только у лавы
+    for _ in range(max(8, width * height // 150)):
+        px = rng.randrange(2, max(3, width - 2))
+        py = rng.randrange(6, max(7, height - 3))
+        size = 1 if rng.random() < 0.7 else 2
+        roll = rng.random()
+        if roll < ember_dust:
+            color = accent
+        elif roll < ember_dust + 0.4:
+            color = soft_light
+        else:
+            color = soft_dark
+        image.fill(color, (px, py, size, size))
+
+    # 5. Трещины: короткие изломы, у угольной темы — светящиеся прожилки
+    for _ in range(max(1, width // 90)):
+        cx = rng.randrange(6, max(7, width - 10))
+        cy = rng.randrange(6, max(7, height - 12))
+        points = [(cx, cy)]
+        for _ in range(rng.randint(2, 3)):
+            cx = max(2, min(width - 3, cx + rng.choice((-2, -1, 1, 2))))
+            cy = max(2, min(height - 3, cy + rng.randint(2, 4)))
+            points.append((cx, cy))
+        crack = _mix(dark, base, 0.35)          # мягкий излом, а не чёрный волос
+        if style == "ember" and rng.random() < 0.35:
+            crack = _mix(accent, base, 0.2)   # светящаяся прожилка
+
+        pygame.draw.lines(image, crack, False, points, 1)
+
+    # 6. Шов кладки по низу: тёмная линия с разрывами, чтобы блоки читались
+    seam = _mix(dark, base, 0.15)
+    x = 0
+    while x < width:
+        run = rng.randint(5, 13)
+        if rng.random() < 0.85:
+            image.fill(seam, (x, height - 1, min(run, width - x), 1))
+        x += run
+
+    # 7. Верхняя грань: светлая кромка и нарост (мох, камень, угольки)
+    if top_open:
+        if style == "moss":
+            moss = palette["top"]
+            soil = palette["soil"]
+            moss_light = _mix(moss, accent, 0.5)
+            depth = 4
+            for x in range(width):
+                depth += rng.choice((-1, 0, 0, 1))     # волнистая кромка мха
+                depth = max(2, min(7, depth))
+                if rng.random() < 0.05:
+                    depth = 1
+                image.fill(moss, (x, 0, 1, depth))
+                if rng.random() < 0.45:
+                    image.fill(moss_light, (x, 0, 1, 1))
+                if rng.random() < 0.14:                # свисающая травинка
+                    image.fill(_mix(moss, dark, 0.3), (x, depth, 1, rng.randint(1, 3)))
+                # под мхом — полоска грунта, чтобы платформа читалась объёмно
+                image.fill(_mix(soil, base, 0.3 + rng.random() * 0.35), (x, depth, 1, 2))
+        else:
+            image.fill(light, (0, 0, width, 2))
+            image.fill(_mix(light, accent, 0.5), (0, 0, width, 1))
+        if style == "stone":
+            for x in range(width):
+                if rng.random() < 0.3:       # выщербленная кромка
+                    image.fill(dark, (x, 2, 1, 1))
+                if rng.random() < 0.16:
+                    image.fill(accent, (x, 0, 1, 1))
+            image.fill(_mix(light, base, 0.45), (0, 2, width, 2))   # жёлоб под кромкой
+            # тень под кромкой, чтобы плита не выглядела плоской
+            image.fill(_mix(base, dark, 0.45), (2, 4, max(1, width - 4), 1))
+        elif style == "ember":               # тлеющие угольки
+            for x in range(width):
+                if rng.random() < 0.18:
+                    image.fill(_mix(accent, base, 0.25), (x, 0, 1, 1))
+            image.fill(_mix(light, base, 0.5), (0, 2, width, 2))    # жёлоб под кромкой
+            image.fill(_mix(base, dark, 0.45), (2, 4, max(1, width - 4), 1))
+
+    # 8. Остальные грани: сначала бока, потом низ — низ перекрывает углы
+    if left_open:
+        image.fill(light, (0, 0, 2, height))
+        image.fill(_mix(light, accent, 0.35), (0, 0, 1, height))
+    if right_open:
+        image.fill(dark, (width - 2, 0, 2, height))
+    if bottom_open:
+        image.fill(dark, (0, height - 2, width, 2))
+        image.fill(_shift(dark, -12), (0, height - 1, width, 1))
+
+    # 9. Швы с соседними блоками — тонкая линия вместо жёсткой сетки
+    seam_soft = _mix(base, dark, 0.62)
+    if not top_open:
+        image.fill(seam_soft, (0, 0, width, 1))
+    if not left_open:
+        image.fill(seam_soft, (0, 0, 1, height))
+
 
 _COIN_FRAME_DIR = os.path.join(settings.ASSETS_DIR, "coin_spin")
 _coin_frames_cache = None
@@ -58,28 +277,13 @@ def load_coin_frames():
 
 
 class Wall(pygame.sprite.Sprite):
-    def __init__(self, x, y, width, height, theme=1):
+    """Блок уровня: текстура зависит от темы, объём — от открытых граней."""
+
+    def __init__(self, x, y, width, height, theme=1,
+                 exposed=(True, True, True, True)):
         super().__init__()
-        base, light, dark, accent = WALL_THEMES.get(theme, WALL_THEMES[1])
         self.image = pygame.Surface((width, height))
-        self.image.fill(base)
-
-        # Объём: светлая кромка сверху/слева, тёмная снизу/справа
-        pygame.draw.line(self.image, light, (0, 0), (width - 1, 0), 2)
-        pygame.draw.line(self.image, light, (0, 0), (0, height - 1), 2)
-        pygame.draw.line(self.image, dark, (0, height - 1), (width - 1, height - 1), 2)
-        pygame.draw.line(self.image, dark, (width - 1, 0), (width - 1, height - 1), 2)
-
-        rng = random.Random((x * 73856093) ^ (y * 19349663) ^ (width * 83492791))
-        for _ in range(max(4, (width * height) // 500)):
-            px = rng.randrange(2, max(3, width - 2))
-            py = rng.randrange(2, max(3, height - 2))
-            self.image.set_at((px, py), rng.choice((light, dark, accent)))
-
-        if theme == 1 and height <= 50:
-            # Мох на верхней кромке лесных платформ
-            pygame.draw.rect(self.image, (74, 110, 58), (0, 0, width, 3))
-
+        _paint_block(self.image, theme, _block_seed(x, y), exposed)
         self.rect = self.image.get_rect(topleft=(x, y))
 
 
@@ -167,13 +371,15 @@ class Coin(pygame.sprite.Sprite):
 
 
 class CoinBurst:
-    """Искры и «+1» при подборе монеты."""
+    """Искры и «+1» при подборе монеты или хилки."""
 
-    def __init__(self, x, y):
+    def __init__(self, x, y, label="+1", color=(255, 226, 120)):
         self.timer = 0
         self.life = 34
         self.x = x
         self.y = y
+        self.label = label
+        self.color = color
         rng = random.Random(x * 131 + y)
         self.particles = []
         for _ in range(9):
@@ -195,12 +401,60 @@ class CoinBurst:
             direction = pygame.math.Vector2(1, 0).rotate(angle)
             x = self.x + offset[0] + direction.x * radius
             y = self.y + offset[1] + direction.y * radius + self.timer * 0.35
-            color = (255, 226, 120) if self.timer % 4 < 2 else (255, 190, 60)
+            color = self.color if self.timer % 4 < 2 else (255, 190, 60)
             pygame.draw.rect(surface, color, (int(x), int(y), 3, 3))
         if font and self.timer < 24:
-            font.draw(surface, "+1", (self.x + offset[0],
-                                      self.y + offset[1] - 14 - self.timer * 0.9),
+            font.draw(surface, self.label, (self.x + offset[0],
+                                            self.y + offset[1] - 14 - self.timer * 0.9),
                       color=settings.TEXT_ACCENT, anchor="center")
+
+
+class Heart:
+    """Хилка: поднимает одно сердце здоровья, если оно потеряно."""
+
+    WIDTH, HEIGHT = 26, 24
+
+    def __init__(self, x, floor_top, block=50, heal=None):
+        self.heal = settings.HEART_HEAL if heal is None else heal
+        self.image = self._render()
+        self.rect = self.image.get_rect(midbottom=(int(x + block // 2),
+                                                   int(floor_top - 4)))
+        self.timer = random.randint(0, 90)
+        self.bob = 0
+        self.glow = pygame.Surface((self.WIDTH + 20, self.HEIGHT + 20), pygame.SRCALPHA)
+        for radius, alpha in ((16, 26), (12, 40), (8, 60)):
+            pygame.draw.circle(self.glow, (255, 90, 110, alpha),
+                               (self.glow.get_width() // 2, self.glow.get_height() // 2),
+                               radius)
+
+    def _render(self):
+        image = pygame.Surface((self.WIDTH, self.HEIGHT), pygame.SRCALPHA)
+        red, light, dark = (222, 52, 66), (255, 138, 148), (138, 22, 38)
+        pygame.draw.rect(image, red, (2, 6, 9, 6))
+        pygame.draw.rect(image, red, (14, 6, 9, 6))
+        pygame.draw.rect(image, red, (4, 12, 18, 5))
+        pygame.draw.rect(image, red, (7, 17, 12, 4))
+        pygame.draw.rect(image, red, (10, 21, 6, 3))
+        pygame.draw.rect(image, dark, (2, 6, 9, 2))
+        pygame.draw.rect(image, dark, (14, 6, 9, 2))
+        pygame.draw.rect(image, dark, (4, 16, 18, 2))
+        pygame.draw.rect(image, light, (5, 7, 4, 3))
+        pygame.draw.rect(image, light, (15, 9, 3, 2))
+        return image
+
+    def update(self):
+        self.timer += 1
+        self.bob = int(round(math.sin(self.timer * 0.09) * 2.5))
+
+    def draw(self, surface, offset=(0, 0)):
+        center = (self.rect.x + offset[0] + self.WIDTH // 2,
+                  self.rect.y + offset[1] + self.HEIGHT // 2 + self.bob)
+        glow = self.glow
+        glow.set_alpha(150 + int(60 * math.sin(self.timer * 0.09)))
+        surface.blit(glow, (center[0] - glow.get_width() // 2,
+                            center[1] - glow.get_height() // 2))
+        surface.blit(self.image, (center[0] - self.WIDTH // 2,
+                                  center[1] - self.HEIGHT // 2))
 
 
 class Lever(pygame.sprite.Sprite):
@@ -339,19 +593,165 @@ class Goal:
             pygame.draw.rect(surface, (206, 252, 255), (px, py, 2, 2))
 
 
-class Skeleton:
-    """Скелет-воин пещеры: патрулирует, догоняет и бьёт мечом."""
+# --- СПРАЙТ-ЛИСТ СКЕЛЕТА: assets/skeleton.jpg (4 кадра на белом фоне) ---
+_SKELETON_BG = (254, 254, 254)        # цвет фона листа
+_SKELETON_BG_TOLERANCE = 18           # запас на JPEG-шум вокруг фигуры
+_SKELETON_HURT_TINT = (255, 96, 96)   # оттенок при попадании по скелету
+_skeleton_frames_cache = None
 
-    WIDTH, HEIGHT = 36, 54
-    BONE = (236, 234, 222)
-    BONE_DARK = (196, 192, 178)
-    SOCKET = (26, 22, 30)
-    CAPE = (48, 76, 158)
-    CAPE_LIGHT = (76, 110, 202)
-    CAPE_DARK = (32, 48, 108)
-    IRON = (172, 178, 192)
-    WOOD = (128, 76, 42)
-    WOOD_DARK = (86, 50, 26)
+
+def _skeleton_mask(surface):
+    """Маска фигуры: всё, что светлее фона листа, становится прозрачным."""
+    tolerance = (_SKELETON_BG_TOLERANCE,) * 3 + (255,)
+    mask = pygame.mask.from_threshold(surface, _SKELETON_BG, tolerance)
+    mask.invert()
+    return mask
+
+
+def _sheet_bands(sheet, strip=6, gap_ratio=0.03, min_gap=20):
+    """Горизонтальные полосы кадров в спрайт-листе: [(x0, x1), ...]."""
+    width, height = sheet.get_size()
+    gap = max(min_gap, int(height * gap_ratio))
+    occupied = []
+    for x in range(0, width, strip):
+        part = sheet.subsurface(pygame.Rect(x, 0, min(strip, width - x), height))
+        occupied.append(_skeleton_mask(part).count() > 0)
+
+    bands, start, blank = [], None, 0
+    for index, hit in enumerate(occupied):
+        x = index * strip
+        if hit:
+            if start is None:
+                start = x
+            blank = 0
+        elif start is not None:
+            blank += 1
+            if blank * strip >= gap:
+                bands.append((start, x - blank * strip + strip - 1))
+                start, blank = None, 0
+    if start is not None:
+        bands.append((start, width - 1))
+    return bands
+
+
+def _cut_skeleton(band):
+    """Вырезает фигуру из полосы листа и убирает белый фон (alpha)."""
+    mask = _skeleton_mask(band)
+    rects = mask.get_bounding_rects()
+    if not rects:
+        return None, None
+    crop = band.subsurface(rects[0].unionall(rects[1:])).copy()
+    mask = _skeleton_mask(crop)
+    silhouette = mask.to_surface(setcolor=(255, 255, 255, 255),
+                                 unsetcolor=(0, 0, 0, 0))
+    frame = crop.convert_alpha()
+    # оставляем цвет фигуры, но берём прозрачность из маски
+    frame.blit(silhouette, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    return frame, mask
+
+
+def _foot_center(mask, rows=10):
+    """Центр X ступней по нижней полосе кадра. Топор тоже лежит в этой полосе,
+    поэтому в skeleton_frames() берётся медиана по всем кадрам."""
+    width, height = mask.get_size()
+    left = right = None
+    for x in range(width):
+        if any(mask.get_at((x, y)) for y in range(max(0, height - rows), height)):
+            left = x if left is None else left
+            right = x
+    if left is None:
+        return width / 2
+    return (left + right) / 2
+
+
+def _fallback_skeleton():
+    """Простой костяной силуэт, если спрайт-лист не загрузился."""
+    image = pygame.Surface((32, 54), pygame.SRCALPHA)
+    bone = (236, 234, 222)
+    pygame.draw.rect(image, bone, (9, 4, 14, 15))              # череп
+    pygame.draw.rect(image, bone, (13, 19, 6, 10))             # позвоночник
+    pygame.draw.rect(image, bone, (7, 29, 18, 8))              # таз
+    pygame.draw.rect(image, bone, (7, 37, 5, 15))              # нога
+    pygame.draw.rect(image, bone, (20, 37, 5, 15))             # нога
+    pygame.draw.rect(image, (26, 22, 30), (11, 8, 4, 4))       # глазницы
+    pygame.draw.rect(image, (26, 22, 30), (17, 8, 4, 4))
+    pygame.draw.rect(image, (128, 76, 42), (25, 22, 3, 24))    # рукоять топора
+    pygame.draw.rect(image, (172, 178, 192), (22, 16, 10, 10))  # лезвие
+    return image
+
+
+def skeleton_frames():
+    """Кадры скелета из листа: {'right': [...], 'left': [...],
+    'flash_right': [...], 'flash_left': [...]}. Результат кэшируется."""
+    global _skeleton_frames_cache
+    if _skeleton_frames_cache is not None:
+        return _skeleton_frames_cache
+
+    sheet = None
+    try:
+        sheet = pygame.image.load(settings.SKELETON_SHEET).convert()
+    except (pygame.error, OSError) as exc:
+        print(f"[ОШИБКА] Не удалось загрузить спрайт скелета: {exc}")
+
+    cut = []
+    if sheet is not None:
+        height = sheet.get_height()
+        for left, right in _sheet_bands(sheet):
+            band = sheet.subsurface(
+                pygame.Rect(left, 0, right - left + 1, height)).copy()
+            frame, mask = _cut_skeleton(band)
+            if frame is not None:
+                cut.append((frame, _foot_center(mask)))
+
+    if not cut:
+        fallback = _fallback_skeleton()
+        _skeleton_frames_cache = {
+            "right": [fallback],
+            "left": [pygame.transform.flip(fallback, True, False)],
+        }
+        return _skeleton_frames_cache
+
+    heights = sorted(frame.get_height() for frame, _ in cut)
+    body_height = heights[len(heights) // 2]        # медиана: кадр с замахом выше
+    scale = settings.SKELETON_HEIGHT / max(1, body_height)
+
+    anchors = sorted(anchor for _, anchor in cut)
+    anchor = anchors[len(anchors) // 2]             # общий якорь, чтобы не «прыгало»
+    half = max(max(anchor, frame.get_width() - anchor) for frame, _ in cut) * scale
+    canvas_w = max(1, int(round(half * 2)))
+    canvas_h = max(1, int(round(heights[-1] * scale)))
+
+    def prepare(frame, flash):
+        size = (max(1, int(round(frame.get_width() * scale))),
+                max(1, int(round(frame.get_height() * scale))))
+        scaled = pygame.transform.smoothscale(frame, size)
+        if flash:      # красный оттенок при попадании: альфа костей сохраняется
+            scaled.fill(_SKELETON_HURT_TINT, special_flags=pygame.BLEND_RGB_MULT)
+        canvas = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+        canvas.blit(scaled, (int(round(canvas_w / 2 - anchor * scale)),
+                             canvas_h - size[1]))
+        return canvas
+
+    right = [prepare(frame, False) for frame, _ in cut]
+    flashes = [prepare(frame, True) for frame, _ in cut]
+    _skeleton_frames_cache = {
+        "right": right,
+        "left": [pygame.transform.flip(frame, True, False) for frame in right],
+        "flash_right": flashes,
+        "flash_left": [pygame.transform.flip(frame, True, False) for frame in flashes],
+    }
+    return _skeleton_frames_cache
+
+
+class Skeleton:
+    """Скелет-воин пещеры: патрулирует, догоняет и бьёт топором."""
+
+    # Кадры спрайт-листа: 0 — шаг вперёд, 1 — замах, 2 — удар, 3 — стойка
+    IDLE_POSE = 3
+    WALK_POSES = (0, 3)
+    ATTACK_POSES = (1, 2, 3)
+    IDLE_TICKS = 14
+    WALK_TICKS = 8
 
     def __init__(self, x, floor_top):
         self.rect = pygame.Rect(0, 0, 26, 46)
@@ -370,62 +770,33 @@ class Skeleton:
         self.dead = False
         self.death_timer = 0
         self.anim = 0
-        self.frames = {1: self._render(1, False), -1: self._render(-1, False)}
-        self.flash_frames = {1: self._render(1, True), -1: self._render(-1, True)}
-        self.image = self.frames[1]
+        self.wake_timer = settings.SKELETON_WAKE_TICKS
+        # Готовые кадры: frames[facing][kind][index]
+        self.frames = {facing: self._poses(facing) for facing in (1, -1)}
+        self.flash_frames = {facing: self._poses(facing, flash=True)
+                             for facing in (1, -1)}
+        self.image = self.frames[1]["idle"][0]
 
     # --- Отрисовка ---
-    def _render(self, facing, flash):
-        image = pygame.Surface((self.WIDTH, self.HEIGHT), pygame.SRCALPHA)
-        bone = (255, 255, 255) if flash else self.BONE
-        bone_dark = (240, 240, 240) if flash else self.BONE_DARK
-        cape = (255, 255, 255) if flash else self.CAPE
-        cape_light = (255, 255, 255) if flash else self.CAPE_LIGHT
-        cape_dark = (215, 215, 215) if flash else self.CAPE_DARK
-        iron = (255, 255, 255) if flash else self.IRON
-        wood = (255, 245, 245) if flash else self.WOOD
-        wood_dark = (225, 205, 205) if flash else self.WOOD_DARK
-        socket = (70, 24, 24) if flash else self.SOCKET
+    def _poses(self, facing, flash=False):
+        """Раскладывает кадры спрайт-листа по состояниям."""
+        bank = skeleton_frames()
+        key = ("left" if facing < 0 else "right") + ("_flash" if flash else "")
+        sheet = bank.get(key) or []
+        if not sheet:
+            image = _fallback_skeleton()
+            if facing < 0:
+                image = pygame.transform.flip(image, True, False)
+            return {"idle": [image], "walk": [image], "attack": [image]}
 
-        # ноги и ступни
-        pygame.draw.rect(image, bone, (12, 38, 4, 12))
-        pygame.draw.rect(image, bone, (20, 38, 4, 12))
-        pygame.draw.rect(image, bone_dark, (9, 50, 8, 3))
-        pygame.draw.rect(image, bone_dark, (20, 50, 8, 3))
-        # таз и рёбра
-        pygame.draw.rect(image, bone_dark, (12, 33, 13, 5))
-        pygame.draw.rect(image, bone, (11, 22, 15, 12))
-        for rib in (25, 28, 31):
-            pygame.draw.rect(image, socket, (13, rib, 11, 1))
-        pygame.draw.rect(image, bone_dark, (17, 22, 2, 12))
-        # накидка
-        pygame.draw.polygon(image, cape, ((6, 16), (30, 16), (32, 27), (26, 25),
-                                          (23, 35), (14, 35), (11, 25), (4, 27)))
-        pygame.draw.line(image, cape_light, (7, 17), (29, 17), 2)
-        pygame.draw.line(image, cape_dark, (6, 19), (9, 31), 2)
-        pygame.draw.line(image, cape_dark, (29, 19), (26, 31), 2)
-        # череп
-        pygame.draw.rect(image, bone, (11, 2, 14, 13))
-        pygame.draw.rect(image, bone_dark, (12, 14, 12, 3))
-        pygame.draw.rect(image, socket, (13, 5, 4, 4))
-        pygame.draw.rect(image, socket, (19, 5, 4, 4))
-        pygame.draw.rect(image, socket, (17, 10, 2, 3))
-        for tooth in range(4):
-            pygame.draw.rect(image, socket, (13 + tooth * 3, 14, 1, 3))
-        # рука с мечом
-        pygame.draw.rect(image, bone, (26, 23, 4, 11))
-        pygame.draw.polygon(image, iron, ((29, 24), (33, 22), (34, 4), (30, 3)))
-        pygame.draw.line(image, (230, 236, 248), (33, 4), (30, 3), 1)
-        pygame.draw.rect(image, wood_dark, (26, 26, 8, 2))
-        # щит
-        pygame.draw.rect(image, wood, (2, 24, 12, 15))
-        pygame.draw.rect(image, wood_dark, (2, 24, 12, 15), 1)
-        pygame.draw.circle(image, iron, (8, 31), 3)
-        pygame.draw.circle(image, wood_dark, (8, 31), 3, 1)
+        def pick(index):
+            return sheet[min(index, len(sheet) - 1)]
 
-        if facing < 0:
-            image = pygame.transform.flip(image, True, False)
-        return image
+        return {
+            "idle": [pick(self.IDLE_POSE)],
+            "walk": [pick(index) for index in self.WALK_POSES],
+            "attack": [pick(index) for index in self.ATTACK_POSES],
+        }
 
     # --- Бой ---
     def take_damage(self, amount, direction=1):
@@ -434,13 +805,16 @@ class Skeleton:
         self.hp = max(0, self.hp - amount)
         self.hurt_timer = 12
         self.rect.x += 7 * direction
+        # Попадание сбивает замах: скелет не может мгновенно контратаковать
+        self.attack_timer = 0
+        self.attack_cooldown = max(self.attack_cooldown, settings.SKELETON_HURT_STUN)
         if self.hp <= 0:
             self.dead = True
             self.death_timer = 0
         return self.dead
 
     def strike_rect(self):
-        """Зона удара мечом в активных кадрах замаха."""
+        """Зона удара топором в активных кадрах замаха."""
         if self.dead or self.attack_timer <= 0:
             return None
         if not (settings.SKELETON_ATTACK_WINDUP
@@ -453,6 +827,8 @@ class Skeleton:
     # --- Логика ---
     def update(self, player, walls):
         self.anim += 1
+        if self.wake_timer > 0:
+            self.wake_timer -= 1
         if self.hurt_timer > 0:
             self.hurt_timer -= 1
         if self.attack_cooldown > 0:
@@ -460,11 +836,11 @@ class Skeleton:
 
         if self.dead:
             self.death_timer += 1
-            self.image = self.frames[self.facing]
+            self._update_animation()
             return
 
         dx = 0
-        player_ok = player is not None and player.alive
+        player_ok = player is not None and player.alive and self.wake_timer <= 0
         if player_ok:
             dx = player.rect.centerx - self.rect.centerx
 
@@ -498,7 +874,40 @@ class Skeleton:
                 self.vel_x = 0.0
 
         self._physics(walls)
-        self.image = (self.flash_frames if self.hurt_timer > 0 else self.frames)[self.facing]
+        if self.rect.top > settings.SCREEN_HEIGHT + 120:   # упал в пропасть
+            self.dead = True
+            self.death_timer = 60
+        self._update_animation()
+
+    def _update_animation(self):
+        """Выбирает кадр: ожидание, ходьба или удар."""
+        if self.dead:
+            self.image = self.frames[self.facing]["idle"][0]
+            return
+        if self.attack_timer > 0:
+            kind = "attack"
+            frames = self.frames[self.facing][kind]
+            windup = settings.SKELETON_ATTACK_WINDUP
+            if self.attack_timer < windup:
+                index = 0            # замах: топор поднят над головой
+            elif self.attack_timer <= windup + 10:
+                index = 1            # удар: топор в земле + дуга (активные кадры)
+            else:
+                index = 2            # возврат в стойку
+            index = min(index, len(frames) - 1)
+        elif abs(self.vel_x) > 0.2:
+            kind = "walk"
+            frames = self.frames[self.facing][kind]
+            index = (self.anim // self.WALK_TICKS) % len(frames)
+        else:
+            kind = "idle"
+            frames = self.frames[self.facing][kind]
+            index = (self.anim // self.IDLE_TICKS) % len(frames)
+        if self.hurt_timer > 0:
+            flash = self.flash_frames[self.facing][kind]
+            self.image = flash[index % len(flash)]
+        else:
+            self.image = frames[index]
 
     def _physics(self, walls):
         self.rect.x += int(self.vel_x)

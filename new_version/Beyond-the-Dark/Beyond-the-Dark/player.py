@@ -1,6 +1,7 @@
 # player.py
 """Игрок: ходьба, прыжок, атака мечом и здоровье."""
 import glob
+import math
 import os
 import re
 
@@ -9,11 +10,13 @@ import pygame
 import settings
 
 WALK_FRAME_TICKS = 5       # скорость анимации ходьбы
+IDLE_FRAME_TICKS = 16      # скорость анимации ожидания (дыхание)
 ATTACK_FRAME_TICKS = 4     # скорость анимации атаки
 ATTACK_COOLDOWN = 10       # пауза после атаки
-ATTACK_ACTIVE_FRAMES = (2, 3, 4, 5)   # кадры, на которых работает удар
+ATTACK_ACTIVE_FRAMES = (2, 3, 4, 5, 6)   # кадры, на которых работает удар
 
 _FALLBACK_SIZE = (30, 54)
+_frames_cache = None       # кадры игрока грузятся один раз на весь сеанс
 
 
 def _numeric_key(path):
@@ -52,8 +55,27 @@ def _union_bbox(surfaces):
     return pygame.Rect(left, top, right - left, bottom - top)
 
 
+def _breath_frames(frame, count=4, amount=2):
+    """Анимация ожидания: едва заметное «дыхание» из кадра покоя."""
+    width, height = frame.get_size()
+    canvas_height = height + amount
+    frames = []
+    for index in range(count):
+        phase = math.sin(index * math.tau / count)
+        new_height = max(1, int(round(height + phase * amount)))
+        scaled = pygame.transform.smoothscale(frame, (width, new_height))
+        canvas = pygame.Surface((width, canvas_height), pygame.SRCALPHA)
+        canvas.blit(scaled, (0, canvas_height - new_height))
+        frames.append(canvas)
+    return frames
+
+
 def _load_frames():
-    """Готовит кадры всех состояний в едином масштабе."""
+    """Готовит кадры всех состояний в едином масштабе (результат кэшируется)."""
+    global _frames_cache
+    if _frames_cache is not None:
+        return _frames_cache
+
     raw = {
         "walk_left": _load_folder(settings.PLAYER_WALK_LEFT_DIR),
         "walk_right": _load_folder(settings.PLAYER_WALK_RIGHT_DIR),
@@ -85,13 +107,14 @@ def _load_frames():
     attack_left = [pygame.transform.flip(f, True, False) for f in attack_right]
 
     frames = {
-        "idle_left": [walk_left[0]],
-        "idle_right": [walk_right[0]],
+        "idle_left": _breath_frames(walk_left[0]),
+        "idle_right": _breath_frames(walk_right[0]),
         "walk_left": walk_left,
         "walk_right": walk_right,
         "attack_left": attack_left,
         "attack_right": attack_right,
     }
+    _frames_cache = frames
     return frames
 
 
@@ -188,14 +211,17 @@ class Player(pygame.sprite.Sprite):
         return True
 
     def attack_rect(self):
-        """Зона удара мечом (только в активных кадрах)."""
+        """Зона удара мечом (только в активных кадрах).
+
+        Зона начинается от центра игрока, поэтому скелет в упор тоже получает удар.
+        """
         if not self.attacking or self.attack_frame not in ATTACK_ACTIVE_FRAMES:
             return None
-        width, height = 46, 34
+        width, height = 62, 42
         if self.facing == "right":
-            topleft = (self.rect.right + 4, self.rect.centery - height // 2)
+            topleft = (self.rect.centerx - 8, self.rect.centery - height // 2)
         else:
-            topleft = (self.rect.left - 4 - width, self.rect.centery - height // 2)
+            topleft = (self.rect.centerx + 8 - width, self.rect.centery - height // 2)
         return pygame.Rect(topleft, (width, height))
 
     def take_damage(self, amount=1):
@@ -291,7 +317,8 @@ class Player(pygame.sprite.Sprite):
             self.anim_timer = 0
         elif len(frames) > 1:
             self.anim_timer += 1
-            if self.anim_timer >= WALK_FRAME_TICKS:
+            ticks = IDLE_FRAME_TICKS if state.startswith("idle") else WALK_FRAME_TICKS
+            if self.anim_timer >= ticks:
                 self.anim_timer = 0
                 self.frame_index = (self.frame_index + 1) % len(frames)
 

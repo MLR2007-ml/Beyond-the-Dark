@@ -17,6 +17,7 @@ RESOLUTIONS = [
 current_res_index = 0
 
 MUSIC_VOLUME = 0.5
+SFX_VOLUME = 0.7
 
 BG_COLOR = (18, 16, 28)
 WALL_COLOR = (80, 80, 100)
@@ -40,6 +41,7 @@ PLAYER_COMBAT_DIR = os.path.join(ASSETS_DIR, "animation_player", "combat")
 PLAYER_HEIGHT = 58
 PLAYER_MAX_HP = 3
 PLAYER_INVULN_TICKS = 90      # ~1.5 сек неуязвимости после урона
+PLAYER_SPAWN_INVULN_TICKS = 70  # неуязвимость сразу после появления на уровне
 PLAYER_ATTACK_DAMAGE = 40
 
 COIN_IMAGE = os.path.join(ASSETS_DIR, "coin.jpg")
@@ -49,16 +51,29 @@ BOSS_IMAGE = os.path.join(ASSETS_DIR, "boss", "boss_dragon.png")
 BOSS_ATTACK_FRAMES = [
     os.path.join(ASSETS_DIR, "boss", f"attack_{i}.png") for i in range(1, 9)
 ]
-BOSS_HEIGHT = 220
-BOSS_MAX_HP = 1000
-BOSS_CHASE_SPEED = 1.4
-BOSS_FLAME_RANGE = 250        # ближе этого — атака пламенем, дальше — фаербол
-BOSS_ATTACK_COOLDOWN = 110    # тиков между атаками
-BOSS_TELEGRAPH_TICKS = 42     # сколько висит "!" перед атакой
-BOSS_FLAME_TICKS = 66
+BOSS_HEIGHT = 152                    # дракон ниже игрового потолка и заметно меньше арены
+BOSS_MAX_HP = 480                    # 12 ударов мечом вместо 25
+BOSS_CHASE_SPEED = 1.2
+BOSS_FLAME_RANGE = 185               # ближе этого — атака пламенем, дальше — скалы
+BOSS_ATTACK_COOLDOWN = 130           # тиков между атаками
+BOSS_TELEGRAPH_TICKS = 40            # сколько висит "!" перед атакой
+BOSS_FLAME_TICKS = 60
 BOSS_RECOVER_TICKS = 34
 BOSS_CONTACT_DAMAGE = 1
-FIREBALL_SPEED = 5.5
+
+# --- СКАЛЫ БОССА (вместо фаерболов) ---
+# Один спрайт-сталактит: белый фон вырезается при загрузке (boss.py).
+ROCK_IMAGE = os.path.join(ASSETS_DIR, "stalactites", "big.jpg")
+# Высота сталактита в пикселях; ширина считается по пропорциям спрайта.
+ROCK_SIZES = {"small": 64, "medium": 84, "big": 108}
+ROCK_GRAVITY = 0.55
+ROCK_FALL_SPEED = 2.0
+ROCK_WARMUP_TICKS = 24               # скала трясётся под потолком перед падением
+ROCK_COUNT = 2                       # сколько глыб падает за одну атаку
+ROCK_DAMAGE = 1
+
+# --- ХИЛКИ ---
+HEART_HEAL = 1
 
 # --- ФОНЫ УРОВНЕЙ ---
 BACKGROUNDS = {
@@ -88,6 +103,14 @@ LEVEL_MUSIC = {
     3: os.path.join(BASE_DIR, "music", "lvl3.mp3"),
 }
 
+# --- ЗВУКОВЫЕ ЭФФЕКТЫ ---
+SOUNDS = {
+    "swing": os.path.join(BASE_DIR, "music", "sword-saber-swing-in-the-air-2.mp3"),
+    "skeleton_hit": os.path.join(BASE_DIR, "music", "a-loud-clear-cracking-sound.mp3"),
+    "coin": os.path.join(BASE_DIR, "music", "svetilo-dobyito--siyanie.mp3"),
+    "heal": os.path.join(BASE_DIR, "music", "serdechko--jizn-1.mp3"),
+}
+
 WINDOW_MODES = ["Оконный", "Без рамок", "Полный экран"]
 current_mode_index = 0
 
@@ -96,15 +119,19 @@ SAVE_FILE = os.path.join(BASE_DIR, "save.json")
 STAR_THRESHOLDS = (0.5, 0.8)   # 50% монет — 1 звезда, 80% — 2, 100% — 3
 
 # --- ВРАГИ: СКЕЛЕТЫ ПЕЩЕРЫ ---
+SKELETON_SHEET = os.path.join(ASSETS_DIR, "skeleton.jpg")   # лист из 4 кадров
+SKELETON_HEIGHT = 58           # высота фигуры скелета на экране
 SKELETON_HP = 80
 SKELETON_SPEED = 1.6           # патруль
 SKELETON_CHASE_SPEED = 2.6     # погоня
 SKELETON_DETECT_RANGE = 330
 SKELETON_ATTACK_RANGE = 56
-SKELETON_ATTACK_WINDUP = 18    # тиков до удара мечом
+SKELETON_ATTACK_WINDUP = 18    # тиков до удара топором
 SKELETON_ATTACK_TICKS = 34
 SKELETON_ATTACK_COOLDOWN = 95
 SKELETON_DAMAGE = 1
+SKELETON_WAKE_TICKS = 55       # пауза перед погоней после старта уровня
+SKELETON_HURT_STUN = 30        # скелет не контратакует сразу после попадания
 
 # --- ТЬМА УРОВНЕЙ: затемнение всего уровня + круг света вокруг игрока ---
 LEVEL_DARKNESS = {1: 96, 2: 190, 3: 44}

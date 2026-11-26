@@ -1,11 +1,15 @@
 # boss.py
-"""Дракон-босс финального уровня: погоня, пламя и фаерболы."""
+"""Дракон-босс финального уровня: погоня, пламя и обвал камней."""
 import math
 import os
+import random
 
 import pygame
 
 import settings
+
+
+ROCK_CACHE = {}
 
 
 def _load_boss_frames():
@@ -43,50 +47,167 @@ def _load_boss_frames():
     return idle, attack
 
 
-class Fireball:
-    def __init__(self, x, y, vx, vy):
-        self.x = float(x)
-        self.y = float(y)
-        self.vx = vx
-        self.vy = vy
-        self.radius = 9
-        self.life = 210
-        self.dead = False
+def _strip_white(image):
+    """Вырезает белый фон и обрезает прозрачные поля спрайта-сталактита."""
+    width, height = image.get_size()
+    for px in range(width):
+        for py in range(height):
+            red, green, blue, _alpha = image.get_at((px, py))
+            low, high = min(red, green, blue), max(red, green, blue)
+            if low > 186 and high - low < 54:          # белый фон и его шум
+                alpha = 0
+            elif low > 146 and high - low < 38:        # светлая кромка — полупрозрачная
+                alpha = 110
+            else:
+                alpha = 255
+            if alpha != 255:
+                image.set_at((px, py), (red, green, blue, alpha))
+    box = image.get_bounding_rect(min_alpha=40)
+    if box.width > 2 and box.height > 2:
+        image = image.subsurface(box).copy()
+    return image
+
+
+def _rock_source():
+    """Спрайт big с вырезанным белым фоном (грузится один раз)."""
+    if "image" in ROCK_CACHE:
+        return ROCK_CACHE["image"]
+    image = None
+    path = settings.ROCK_IMAGE
+    if path and os.path.exists(path):
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+            # Обрабатываем уменьшенную копию: пиксельный проход по 1536 × 1024
+            # был бы заметно медленнее на старте боя.
+            height = 260
+            width = max(1, round(raw.get_width() * height / raw.get_height()))
+            image = _strip_white(pygame.transform.smoothscale(raw, (width, height)))
+        except (pygame.error, OSError) as exc:
+            print(f"[ОШИБКА] Не удалось загрузить сталактит: {exc}")
+    ROCK_CACHE["image"] = image
+    return image
+
+
+def _rock_image(size_key):
+    """Один и тот же сталактит, отмасштабированный по высоте (пропорции целы)."""
+    height = settings.ROCK_SIZES.get(size_key, 84)
+    cache_key = ("rock", height)
+    if cache_key in ROCK_CACHE:
+        return ROCK_CACHE[cache_key]
+
+    source = _rock_source()
+    if source is not None:
+        width = max(3, round(source.get_width() * height / source.get_height()))
+        image = pygame.transform.smoothscale(source, (width, height))
+    else:
+        width = max(8, int(height * 0.55))
+        image = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.polygon(image, (104, 100, 114),
+                            ((width * 0.50, 0), (width * 0.96, height * 0.34),
+                             (width * 0.64, height * 0.92), (width * 0.36, height * 0.92),
+                             (width * 0.04, height * 0.36)))
+        pygame.draw.polygon(image, (146, 142, 158),
+                            ((width * 0.50, height * 0.06), (width * 0.82, height * 0.34),
+                             (width * 0.56, height * 0.28)))
+    ROCK_CACHE[cache_key] = image
+    return image
+
+
+class Rock:
+    """Сталактит, который дракон обрушивает на арену.
+
+    Сначала глыба трясётся у потолка (по полу видна метка), затем падает:
+    попадание по игроку снимает одно сердце и разбивает камень.
+    """
+
+    TOP = 4                     # по умолчанию — от верха экрана (см. ceiling)
+
+    def __init__(self, x, floor_top, size_key="medium", top=None):
+        self.size_key = size_key
+        self.image = _rock_image(size_key)
+        top = self.TOP if top is None else int(top)
+        self.rect = self.image.get_rect(midtop=(int(x), top))
+        self.base_x = self.rect.x
+        self.y = float(self.rect.y)
+        self.vy = settings.ROCK_FALL_SPEED
         self.timer = 0
-        self.trail = []
+        self.warmup = settings.ROCK_WARMUP_TICKS
+        self.floor_top = int(floor_top)
+        self.dead = False
+        self.landed = False
+        self.land_timer = 0
 
     @property
-    def rect(self):
-        return pygame.Rect(int(self.x - self.radius), int(self.y - self.radius),
-                           self.radius * 2, self.radius * 2)
+    def falling(self):
+        return self.warmup <= 0 and not self.landed
 
-    def update(self, walls):
+    def _land(self):
+        self.landed = True
+        self.vy = 0.0
+
+    def update(self, player):
         self.timer += 1
-        self.life -= 1
-        if self.life <= 0:
-            self.dead = True
+        if self.warmup > 0:
+            self.warmup -= 1
+            self.rect.x = self.base_x + int(round(math.sin(self.timer * 0.9) * 3))
             return
-        self.trail.append((self.x, self.y))
-        if len(self.trail) > 7:
-            self.trail.pop(0)
-        self.x += self.vx
+        if self.landed:
+            self.land_timer += 1
+            if self.land_timer > 20:
+                self.dead = True
+            return
+
+        self.vy = min(18.0, self.vy + settings.ROCK_GRAVITY)
         self.y += self.vy
-        for wall in walls:
-            if self.rect.colliderect(wall.rect):
+        self.rect.y = int(self.y)
+        self.rect.x = self.base_x
+
+        if player is not None and player.alive:
+            hit_zone = player.rect.inflate(0, -6)
+            if self.rect.inflate(-self.rect.width * 0.4, 0).colliderect(hit_zone):
+                player.take_damage(settings.ROCK_DAMAGE)
                 self.dead = True
                 return
 
+        # Сталактит всегда доходит до пола: стены по бокам его не останавливают.
+        if self.rect.bottom >= self.floor_top:
+            self.rect.bottom = self.floor_top
+            self._land()
+
     def draw(self, surface):
-        for index, (tx, ty) in enumerate(self.trail):
-            size = max(2, 6 - index // 2)
-            pygame.draw.circle(surface, (190, 60, 16), (int(tx), int(ty)), size)
-        pygame.draw.circle(surface, (236, 92, 18), (int(self.x), int(self.y)), self.radius + 2)
-        pygame.draw.circle(surface, (255, 170, 40), (int(self.x), int(self.y)), self.radius)
-        pygame.draw.circle(surface, (255, 240, 170), (int(self.x), int(self.y)), self.radius // 2)
+        if self.landed:
+            fade = max(40, 255 - self.land_timer * 11)
+            image = self.image.copy()
+            image.set_alpha(fade)
+            surface.blit(image, self.rect)
+            rubble = (128, 124, 138)
+            pygame.draw.rect(surface, rubble, (self.rect.centerx - 14,
+                                               self.rect.bottom - 5, 9, 4))
+            pygame.draw.rect(surface, rubble, (self.rect.centerx + 6,
+                                               self.rect.bottom - 4, 7, 3))
+            return
+
+        shadow = pygame.Rect(0, 0, self.rect.width, 10)
+        shadow.midbottom = (self.base_x + self.rect.width // 2, self.floor_top)
+        pygame.draw.ellipse(surface, (12, 10, 16), shadow)
+        if self.warmup > 0:
+            pulse = 0.5 + 0.5 * math.sin(self.timer * 0.8)
+            pygame.draw.ellipse(surface, (255, int(110 + 100 * pulse), 60),
+                                shadow, 2)
+            drip = (self.timer * 7) % 46
+            pygame.draw.rect(surface, (156, 152, 168),
+                             (shadow.centerx - 2, self.rect.bottom + drip, 4, 5))
+        else:
+            # след падения — едва заметные штрихи, чтобы не спорить с фоном
+            for index in range(3):
+                streak = pygame.Rect(0, 0, 2, 14 + index * 6)
+                streak.midtop = (self.rect.centerx - 10 + index * 10, self.rect.top - 22)
+                pygame.draw.rect(surface, (104, 92, 116), streak)
+        surface.blit(self.image, self.rect)
 
 
 class Dragon(pygame.sprite.Sprite):
-    def __init__(self, center_x, floor_top):
+    def __init__(self, center_x, floor_top, ceiling_top=None):
         super().__init__()
         self.idle_image, self.attack_images = _load_boss_frames()
         if self.idle_image is None:
@@ -98,6 +219,8 @@ class Dragon(pygame.sprite.Sprite):
         image_w, image_h = self.idle_image.get_size()
         self.rect = pygame.Rect(0, 0, int(image_w * 0.60), int(image_h * 0.84))
         self.rect.midbottom = (int(center_x), int(floor_top))
+        # Откуда свисают сталактиты: низ потолочного ряда блоков.
+        self.ceiling_top = Rock.TOP if ceiling_top is None else int(ceiling_top)
 
         self.max_hp = settings.BOSS_MAX_HP
         self.hp = self.max_hp
@@ -112,7 +235,7 @@ class Dragon(pygame.sprite.Sprite):
         self.anim_timer = 0
         self.anim_frame = 0
         self.bob_timer = 0
-        self.fireballs = []
+        self.rocks = []
 
     # --- Геометрия ---
     def image_rect(self):
@@ -147,7 +270,7 @@ class Dragon(pygame.sprite.Sprite):
             self.state = "dead"
             self.timer = 0
             self.dead_timer = 0
-            self.fireballs.clear()
+            self.rocks.clear()
             return True
         return False
 
@@ -165,16 +288,18 @@ class Dragon(pygame.sprite.Sprite):
         self.anim_timer = 0
         self.anim_frame = 0
 
-    def _shoot(self, player):
-        mouth_x, mouth_y = self.mouth_pos()
-        target_x = player.rect.centerx
-        target_y = player.rect.centery
-        base_angle = math.atan2(target_y - mouth_y, target_x - mouth_x)
-        for offset in (-0.12, 0.08):
-            angle = base_angle + offset
-            vx = math.cos(angle) * settings.FIREBALL_SPEED
-            vy = math.sin(angle) * settings.FIREBALL_SPEED
-            self.fireballs.append(Fireball(mouth_x, mouth_y, vx, vy))
+    def _drop_rocks(self, player):
+        """Обвал: по глыбе слева и справа от игрока."""
+        floor_top = self.rect.bottom
+        center = player.rect.centerx if player is not None else self.rect.centerx
+        sizes = ("medium", "big")
+        for index in range(max(1, settings.ROCK_COUNT)):
+            size_key = sizes[index % len(sizes)]
+            half = _rock_image(size_key).get_width() // 2
+            offset = (-95 if index % 2 == 0 else 95) + random.randint(-14, 14)
+            # 56 px — ширина стеновой колонны арены плюс запас: глыба не врезается в стену
+            x = max(half + 56, min(settings.SCREEN_WIDTH - half - 56, center + offset))
+            self.rocks.append(Rock(x, floor_top, size_key, self.ceiling_top))
 
     # --- Логика ---
     def update(self, player, walls):
@@ -182,12 +307,9 @@ class Dragon(pygame.sprite.Sprite):
         if self.flash_timer > 0:
             self.flash_timer -= 1
 
-        for fireball in self.fireballs:
-            fireball.update(walls)
-            if not fireball.dead and fireball.rect.colliderect(player.rect):
-                fireball.dead = True
-                player.take_damage(1)
-        self.fireballs = [fb for fb in self.fireballs if not fb.dead]
+        for rock in self.rocks:
+            rock.update(player)
+        self.rocks = [rock for rock in self.rocks if not rock.dead]
 
         if self.state == "dead":
             self.dead_timer += 1
@@ -212,7 +334,7 @@ class Dragon(pygame.sprite.Sprite):
                 self.rect.x = max(8, min(settings.SCREEN_WIDTH - self.rect.width - 8,
                                           self.rect.x))
             if self.attack_cd <= 0:
-                self.next_action = "flame" if distance <= settings.BOSS_FLAME_RANGE else "fireball"
+                self.next_action = "flame" if distance <= settings.BOSS_FLAME_RANGE else "rocks"
                 self._set_state("telegraph")
 
         elif self.state == "telegraph":
@@ -221,8 +343,8 @@ class Dragon(pygame.sprite.Sprite):
                     self.flame_hit = False
                     self._set_state("flame")
                 else:
-                    self._shoot(player)
-                    self._set_state("shoot")
+                    self._drop_rocks(player)
+                    self._set_state("rocks")
 
         elif self.state == "flame":
             flame = self.flame_rect()
@@ -232,8 +354,9 @@ class Dragon(pygame.sprite.Sprite):
             if self.timer >= settings.BOSS_FLAME_TICKS:
                 self._set_state("recover")
 
-        elif self.state == "shoot":
-            if self.timer >= 28:
+        elif self.state == "rocks":
+            # Камни падают сами; босс «отдыхает», пока не упадут все
+            if self.timer >= 46 and not self.rocks:
                 self._set_state("recover")
 
         elif self.state == "recover":
@@ -242,7 +365,7 @@ class Dragon(pygame.sprite.Sprite):
                 self._set_state("idle")
 
         # Анимация кадров атаки
-        if self.state in ("flame", "shoot"):
+        if self.state in ("flame", "rocks"):
             self.anim_timer += 1
             if self.anim_timer >= 5:
                 self.anim_timer = 0
@@ -293,14 +416,6 @@ class Dragon(pygame.sprite.Sprite):
             pygame.draw.rect(surface, (255, 176, 60),
                              (int(spark_x), int(spark_y), 3, 3))
 
-        # Искры у кончика пламени
-        for index in range(6):
-            phase = self.bob_timer * 0.4 + index * 1.7
-            spark_x = mouth_x + direction * (length * 0.72 + (index * 17) % 55)
-            spark_y = ground - 34 + math.sin(phase) * (12 + index * 2)
-            pygame.draw.rect(surface, (255, 176, 60),
-                             (int(spark_x), int(spark_y), 3, 3))
-
     def draw(self, surface, font=None):
         if self.state == "dead":
             image = self.idle_image.copy()
@@ -317,7 +432,7 @@ class Dragon(pygame.sprite.Sprite):
                 pygame.draw.rect(surface, (220, 90, 30), (int(px), int(py), 3, 3))
             return
 
-        if self.state in ("flame", "shoot", "recover") and self.attack_images:
+        if self.state in ("flame", "rocks", "recover") and self.attack_images:
             image = self.attack_images[self.anim_frame % len(self.attack_images)]
         else:
             image = self.idle_image
@@ -347,8 +462,8 @@ class Dragon(pygame.sprite.Sprite):
                           color=settings.TEXT_ACCENT, anchor="center")
 
     def draw_front(self, surface):
-        """Пламя и фаерболы — поверх игрока, чтобы читался урон."""
-        for fireball in self.fireballs:
-            fireball.draw(surface)
+        """Пламя и падающие камни — поверх игрока, чтобы читался урон."""
+        for rock in self.rocks:
+            rock.draw(surface)
         if self.state == "flame":
             self._draw_flame(surface)
