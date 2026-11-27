@@ -1,0 +1,23 @@
+{
+  "levels": {
+    "1": {
+      "coins": 0,
+      "total": 0,
+      "stars": 0
+    },
+    "2": {
+      "coins": 0,
+      "total": 0,
+      "stars": 0
+    },
+    "3": {
+      "coins": 0,
+      "total": 0,
+      "stars": 0
+    }
+  },
+  "audio": {
+    "music": 1.0,
+    "sfx": 0.05
+  }
+}
